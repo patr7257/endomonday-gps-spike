@@ -1,0 +1,62 @@
+name: ios-unsigned
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/ios-unsigned.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - name: Add iOS platform
+        run: npx cap add ios
+      - name: Patch Info.plist
+        run: |
+          P=ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" $P || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" $P
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string location" $P
+          for K in NSLocationWhenInUseUsageDescription NSLocationAlwaysAndWhenInUseUsageDescription NSLocationAlwaysUsageDescription; do
+            /usr/libexec/PlistBuddy -c "Delete :$K" $P || true
+            /usr/libexec/PlistBuddy -c "Add :$K string GPS Spike records your location to test background tracking." $P
+          done
+          echo "UIBackgroundModes evidence:"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" $P
+      - run: npx cap sync ios
+      - name: Build
+        working-directory: app/ios/App
+        run: |
+          WS=App.xcworkspace
+          [ -d "$WS" ] || WS=""
+          if [ -n "$WS" ]; then TARGET="-workspace $WS"; else TARGET="-project App.xcodeproj"; fi
+          xcodebuild $TARGET -scheme App -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package ipa
+        run: |
+          APP=ios/App/build/Build/Products/Release-iphoneos/App.app
+          echo "Built Info.plist UIBackgroundModes:"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP/Info.plist"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry GPS-Spike.ipa Payload
+          ls -l GPS-Spike.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GPS-Spike.ipa
+          path: app/GPS-Spike.ipa
+          retention-days: 14
