@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="GPS Web Spike">
+<link rel="manifest" href="manifest.webmanifest">
+<title>GPS Web Spike</title>
+<style>
+	:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+	body { margin: 0; padding: 16px; padding-top: max(16px, env(safe-area-inset-top)); }
+	h1 { font-size: 20px; margin: 0 0 12px; }
+	button { font-size: 17px; padding: 12px 16px; margin: 4px 4px 4px 0; border-radius: 10px; border: 1px solid #888; }
+	label { display: block; margin: 8px 0; font-size: 16px; }
+	pre { white-space: pre-wrap; font-size: 13px; background: rgba(127,127,127,.15); padding: 8px; border-radius: 8px; }
+	textarea { width: 100%; height: 120px; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>GPS Web Spike</h1>
+<p>Start, lock the phone, walk 10 minutes, unlock and press Refresh. Points stay on this phone.</p>
+<label><input type="checkbox" id="audio" checked> Keep-alive: play a silent audio loop</label>
+<label><input type="checkbox" id="speech"> Speak a cue every 2 minutes (tests voice while locked)</label>
+<div>
+	<button id="start">Start</button>
+	<button id="stop">Stop</button>
+	<button id="refresh">Refresh</button>
+	<button id="clear">Clear</button>
+	<button id="export">Export</button>
+</div>
+<pre id="stats">No run yet.</pre>
+<textarea id="out" hidden readonly></textarea>
+<script>
+const KEY = "gps-spike-v1";
+const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || { points: [], events: [] }; } catch { return { points: [], events: [] }; } };
+const save = (s) => localStorage.setItem(KEY, JSON.stringify(s));
+let state = load();
+let watchId = null, audio = null, speechTimer = null, cue = 0;
+
+function event(name) { state.events.push({ t: Date.now(), e: name }); save(state); }
+
+// A near-silent WAV built in memory, so the loop needs no file.
+function silentWavUrl(seconds = 2, rate = 8000) {
+	const n = seconds * rate, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+	const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+	w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+	v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+	v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+	w(36, "data"); v.setUint32(40, n * 2, true);
+	for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, (i % 2 ? 1 : -1), true);
+	return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+}
+
+function fmt(t) { return new Date(t).toLocaleTimeString(); }
+
+function render() {
+	const p = state.points;
+	const lines = [`running: ${watchId !== null}`, `points: ${p.length}`];
+	if (p.length) {
+		lines.push(`first: ${fmt(p[0].t)}  last: ${fmt(p[p.length - 1].t)}`);
+		let max = 0; const gaps = [];
+		for (let i = 1; i < p.length; i++) {
+			const g = (p[i].t - p[i - 1].t) / 1000;
+			if (g > max) max = g;
+			if (g > 15) gaps.push(`${fmt(p[i - 1].t)} -> ${fmt(p[i].t)}  ${Math.round(g)} s`);
+		}
+		lines.push(`largest gap: ${Math.round(max)} s`, `gaps over 15 s: ${gaps.length}`, ...gaps);
+		lines.push(`last accuracy: ${Math.round(p[p.length - 1].acc)} m`);
+	}
+	lines.push("", "events:", ...state.events.slice(-30).map((e) => `${fmt(e.t)}  ${e.e}`));
+	document.getElementById("stats").textContent = lines.join("\n");
+}
+
+document.getElementById("start").onclick = async () => {
+	if (watchId !== null) return;
+	event(`start (audio ${document.getElementById("audio").checked}, speech ${document.getElementById("speech").checked})`);
+	if (document.getElementById("audio").checked) {
+		audio = new Audio(silentWavUrl()); audio.loop = true;
+		try { await audio.play(); event("audio playing"); } catch (e) { event(`audio failed: ${e.name}`); }
+		if ("mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: "GPS Spike recording" });
+	}
+	if (document.getElementById("speech").checked) {
+		speechTimer = setInterval(() => {
+			cue += 1; event(`speak cue ${cue}`);
+			speechSynthesis.speak(new SpeechSynthesisUtterance(`Cue ${cue}`));
+		}, 120000);
+	}
+	watchId = navigator.geolocation.watchPosition(
+		(pos) => { state.points.push({ t: pos.timestamp || Date.now(), lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy }); save(state); render(); },
+		(err) => { event(`geo error ${err.code}: ${err.message}`); render(); },
+		{ enableHighAccuracy: true, maximumAge: 0, timeout: 30000 },
+	);
+	render();
+};
+
+document.getElementById("stop").onclick = () => {
+	if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+	watchId = null; if (audio) { audio.pause(); audio = null; } clearInterval(speechTimer); event("stop"); render();
+};
+document.getElementById("refresh").onclick = () => { state = load(); render(); };
+document.getElementById("clear").onclick = () => { state = { points: [], events: [] }; save(state); cue = 0; render(); };
+document.getElementById("export").onclick = () => { const o = document.getElementById("out"); o.hidden = false; o.value = JSON.stringify(state); o.select(); };
+document.addEventListener("visibilitychange", () => { event(`visibility ${document.visibilityState}`); render(); });
+window.addEventListener("pagehide", () => event("pagehide"));
+window.addEventListener("pageshow", (e) => event(`pageshow persisted=${e.persisted}`));
+render();
+</script>
+</body>
+</html>
